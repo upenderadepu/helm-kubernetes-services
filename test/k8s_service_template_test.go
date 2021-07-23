@@ -142,6 +142,20 @@ func TestK8SServiceSecurityContextAnnotationRenderCorrectly(t *testing.T) {
 	assert.Equal(t, *testContainer.SecurityContext.RunAsUser, int64(1000))
 }
 
+func TestK8SServicePodSecurityContextAnnotationRenderCorrectly(t *testing.T) {
+	t.Parallel()
+
+	deployment := renderK8SServiceDeploymentWithSetValues(
+		t,
+		map[string]string{
+			"podSecurityContext.fsGroup": "2000",
+		},
+	)
+	renderedPodSpec := deployment.Spec.Template.Spec
+	assert.NotNil(t, renderedPodSpec.SecurityContext)
+	assert.Equal(t, *renderedPodSpec.SecurityContext.FSGroup, int64(2000))
+}
+
 // Test that podAnnotations render correctly to annotate the Pod Template Spec on the Deployment resource
 func TestK8SServicePodAnnotationsRenderCorrectly(t *testing.T) {
 	t.Parallel()
@@ -571,59 +585,6 @@ func TestK8SServiceWithContainerCommandHasCommandSpec(t *testing.T) {
 	assert.Equal(t, appContainer.Command, []string{"echo", "Hello world"})
 }
 
-// Test that omitting aws.irsa.role_arn does not render the IRSA vars
-func TestK8SServiceWithoutIRSA(t *testing.T) {
-	t.Parallel()
-
-	deployment := renderK8SServiceDeploymentWithSetValues(
-		t,
-		map[string]string{},
-	)
-	renderedPodSpec := deployment.Spec.Template.Spec
-	assert.Equal(t, len(renderedPodSpec.Volumes), 0)
-	renderedPodContainers := renderedPodSpec.Containers
-	require.Equal(t, len(renderedPodContainers), 1)
-	appContainer := renderedPodContainers[0]
-	assert.Equal(t, len(appContainer.Env), 0)
-}
-
-// Test that setting aws.irsa.role_arn renders the IRSA vars
-func TestK8SServiceWithIRSA(t *testing.T) {
-	t.Parallel()
-
-	testRoleArn := "arn:aws:iam::123456789012:role/test-role"
-	deployment := renderK8SServiceDeploymentWithSetValues(
-		t,
-		map[string]string{
-			"aws.irsa.role_arn": testRoleArn,
-		},
-	)
-	renderedPodSpec := deployment.Spec.Template.Spec
-
-	// Verify projected volume
-	require.Equal(t, len(renderedPodSpec.Volumes), 1)
-	volume := renderedPodSpec.Volumes[0]
-	assert.Equal(t, volume.Name, "aws-iam-token")
-	require.NotNil(t, volume.VolumeSource.Projected)
-	projectedVolume := volume.VolumeSource.Projected
-	require.Equal(t, len(projectedVolume.Sources), 1)
-	projectedVolumeSource := projectedVolume.Sources[0]
-	require.NotNil(t, projectedVolumeSource.ServiceAccountToken)
-	assert.Equal(t, projectedVolumeSource.ServiceAccountToken.Audience, "sts.amazonaws.com")
-
-	// Verify injected env vars
-	renderedPodContainers := renderedPodSpec.Containers
-	require.Equal(t, len(renderedPodContainers), 1)
-	appContainer := renderedPodContainers[0]
-	assert.Equal(t, len(appContainer.Env), 2)
-	roleArnEnv := appContainer.Env[0]
-	assert.Equal(t, roleArnEnv.Name, "AWS_ROLE_ARN")
-	assert.Equal(t, roleArnEnv.Value, testRoleArn)
-	tokenEnv := appContainer.Env[1]
-	assert.Equal(t, tokenEnv.Name, "AWS_WEB_IDENTITY_TOKEN_FILE")
-	assert.Equal(t, tokenEnv.Value, "/var/run/secrets/eks.amazonaws.com/serviceaccount/token")
-}
-
 // Test that providing tls configuration to Ingress renders correctly
 func TestK8SServiceIngressMultiCert(t *testing.T) {
 	t.Parallel()
@@ -722,7 +683,7 @@ func TestK8SServiceDeploymentAddingAdditionalLabels(t *testing.T) {
 	second_custom_deployment_label_value := "second-custom-value"
 	deployment := renderK8SServiceDeploymentWithSetValues(t,
 		map[string]string{"additionalDeploymentLabels.first-label": first_custom_deployment_label_value,
-			"additionalDeploymentLabels.second-label":second_custom_deployment_label_value})
+			"additionalDeploymentLabels.second-label": second_custom_deployment_label_value})
 
 	assert.Equal(t, deployment.Labels["first-label"], first_custom_deployment_label_value)
 	assert.Equal(t, deployment.Labels["second-label"], second_custom_deployment_label_value)
@@ -733,43 +694,146 @@ func TestK8SServicePodAddingAdditionalLabels(t *testing.T) {
 	first_custom_pod_label_value := "first-custom-value"
 	second_custom_pod_label_value := "second-custom-value"
 	deployment := renderK8SServiceDeploymentWithSetValues(t,
-		map[string]string{"additionalPodLabels.first-label":  first_custom_pod_label_value,
+		map[string]string{"additionalPodLabels.first-label": first_custom_pod_label_value,
 			"additionalPodLabels.second-label": second_custom_pod_label_value})
 
 	assert.Equal(t, deployment.Spec.Template.Labels["first-label"], first_custom_pod_label_value)
 	assert.Equal(t, deployment.Spec.Template.Labels["second-label"], second_custom_pod_label_value)
 }
 
-func TestK8SServiceDeploymentAddingPersistentVolumes(t *testing.T) {
+func TestK8SServiceDeploymentStrategyOnlySetIfEnabled(t *testing.T) {
 	t.Parallel()
-
-	volName := "pv-1"
-	volClaim := "claim-1"
-	volMountPath := "/mnt/path/1"
 
 	deployment := renderK8SServiceDeploymentWithSetValues(
 		t,
 		map[string]string{
-			"persistentVolumes.pv-1.claimName": volClaim,
-			"persistentVolumes.pv-1.mountPath": volMountPath,
+			"deploymentStrategy.enabled": "false",
 		},
 	)
 
-	// Verify that there is only one container and that the environments section is populated.
-	renderedPodContainers := deployment.Spec.Template.Spec.Containers
-	require.Equal(t, len(renderedPodContainers), 1)
+	// Strategy shouldn't be set
+	assert.Equal(t, "", string(deployment.Spec.Strategy.Type))
+	assert.Nil(t, deployment.Spec.Strategy.RollingUpdate)
+}
 
-	// Verify that a mount has been created for the PV
-	mounts := renderedPodContainers[0].VolumeMounts
-	assert.Equal(t, len(mounts), 1)
-	mount := mounts[0]
-	assert.Equal(t, volName, mount.Name)
-	assert.Equal(t, volMountPath, mount.MountPath)
+func TestK8SServiceDeploymentRollingUpdateStrategy(t *testing.T) {
+	t.Parallel()
 
-	// Verify that a volume has been declared for the PV
-	volumes := deployment.Spec.Template.Spec.Volumes
-	assert.Equal(t, len(volumes), 1)
-	volume := volumes[0]
-	assert.Equal(t, volName, volume.Name)
-	assert.Equal(t, volClaim, volume.PersistentVolumeClaim.ClaimName)
+	deployment := renderK8SServiceDeploymentWithSetValues(
+		t,
+		map[string]string{
+			"deploymentStrategy.enabled": "true",
+			"deploymentStrategy.type":    "RollingUpdate",
+		},
+	)
+
+	assert.EqualValues(t, "RollingUpdate", string(deployment.Spec.Strategy.Type))
+	require.Nil(t, deployment.Spec.Strategy.RollingUpdate)
+}
+
+func TestK8SServiceDeploymentRollingUpdateStrategyWithCustomOptions(t *testing.T) {
+	t.Parallel()
+
+	deployment := renderK8SServiceDeploymentWithSetValues(
+		t,
+		map[string]string{
+			"deploymentStrategy.enabled":                      "true",
+			"deploymentStrategy.type":                         "RollingUpdate",
+			"deploymentStrategy.rollingUpdate.maxSurge":       "30%",
+			"deploymentStrategy.rollingUpdate.maxUnavailable": "20%",
+		},
+	)
+
+	assert.EqualValues(t, "RollingUpdate", string(deployment.Spec.Strategy.Type))
+
+	rollingUpdateOptions := deployment.Spec.Strategy.RollingUpdate
+	require.NotNil(t, rollingUpdateOptions)
+	assert.Equal(t, rollingUpdateOptions.MaxSurge.String(), "30%")
+	assert.Equal(t, rollingUpdateOptions.MaxUnavailable.String(), "20%")
+}
+
+func TestK8SServiceDeploymentRecreateStrategy(t *testing.T) {
+	t.Parallel()
+
+	deployment := renderK8SServiceDeploymentWithSetValues(
+		t,
+		map[string]string{
+			"deploymentStrategy.enabled": "true",
+			"deploymentStrategy.type":    "Recreate",
+		},
+	)
+
+	assert.Equal(t, "Recreate", string(deployment.Spec.Strategy.Type))
+	assert.Nil(t, deployment.Spec.Strategy.RollingUpdate)
+
+	// Test that custom rolling update options are ignore if the strategy is set to recreate
+	deployment = renderK8SServiceDeploymentWithSetValues(
+		t,
+		map[string]string{
+			"deploymentStrategy.enabled":                      "true",
+			"deploymentStrategy.type":                         "Recreate",
+			"deploymentStrategy.rollingUpdate.maxSurge":       "30%",
+			"deploymentStrategy.rollingUpdate.maxUnavailable": "20%",
+		},
+	)
+
+	assert.Equal(t, "Recreate", string(deployment.Spec.Strategy.Type))
+	assert.Nil(t, deployment.Spec.Strategy.RollingUpdate)
+}
+
+func TestK8SServiceFullnameOverride(t *testing.T) {
+	t.Parallel()
+
+	overiddenName := "overidden-name"
+
+	deployment := renderK8SServiceDeploymentWithSetValues(t,
+		map[string]string{
+			"fullnameOverride": overiddenName,
+		},
+	)
+
+	assert.Equal(t, deployment.Name, overiddenName)
+}
+
+func TestK8SServiceEnvFrom(t *testing.T) {
+	t.Parallel()
+
+	t.Run("BothConfigMapsAndSecretsEnvFrom", func(t *testing.T) {
+		deployment := renderK8SServiceDeploymentWithSetValues(t,
+			map[string]string{
+				"configMaps.test-configmap.as": "envFrom",
+				"secrets.test-secret.as": "envFrom",
+			},
+		)
+
+		assert.NotNil(t, deployment.Spec.Template.Spec.Containers[0].EnvFrom)
+		assert.Equal(t, len(deployment.Spec.Template.Spec.Containers[0].EnvFrom), 2)
+		assert.Equal(t, deployment.Spec.Template.Spec.Containers[0].EnvFrom[0].ConfigMapRef.Name, "test-configmap")
+		assert.Equal(t, deployment.Spec.Template.Spec.Containers[0].EnvFrom[1].SecretRef.Name, "test-secret")
+	})
+
+	t.Run("OnlyConfigMapsEnvFrom", func(t *testing.T) {
+		deployment := renderK8SServiceDeploymentWithSetValues(t,
+			map[string]string{
+				"configMaps.test-configmap.as": "envFrom",
+			},
+		)
+
+		assert.NotNil(t, deployment.Spec.Template.Spec.Containers[0].EnvFrom)
+		assert.Equal(t, len(deployment.Spec.Template.Spec.Containers[0].EnvFrom), 1)
+		assert.Equal(t, deployment.Spec.Template.Spec.Containers[0].EnvFrom[0].ConfigMapRef.Name, "test-configmap")
+	})
+
+	t.Run("OnlySecretsEnvFrom", func(t *testing.T) {
+		deployment := renderK8SServiceDeploymentWithSetValues(t,
+			map[string]string{
+				"secrets.test-secret.as": "envFrom",
+			},
+		)
+
+		assert.NotNil(t, deployment.Spec.Template.Spec.Containers[0].EnvFrom)
+		assert.Equal(t, len(deployment.Spec.Template.Spec.Containers[0].EnvFrom), 1)
+		assert.Equal(t, deployment.Spec.Template.Spec.Containers[0].EnvFrom[0].SecretRef.Name, "test-secret")
+	})
+
 }
